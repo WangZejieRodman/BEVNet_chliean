@@ -49,11 +49,8 @@ class ChileanDatasetOverlap(Dataset):
                  num_iter=300000) -> None:
         super().__init__()
         self.num_iter = num_iter
-        self.icp_path = os.path.join(root, "icp_chilean")  # ICP缓存路径
-        pathlib.Path(self.icp_path).mkdir(parents=True, exist_ok=True)
         self.div_n = div_n
         self.coords_range_xyz = coords_range_xyz
-        self.chilean_icp_cache = {}
         self.random_rotation = random_rotation
         self.random_occ = random_occ
         self.device = torch.device('cpu')
@@ -159,17 +156,6 @@ class ChileanDatasetOverlap(Dataset):
         # 加载float64并转换为float32
         return np.fromfile(file, dtype='float64').reshape(-1, 3).astype('float32')
 
-    def get_icp_name(self, query_id, pos_id):
-        """生成ICP缓存文件名"""
-        query = self.pairs[query_id]
-        pos = self.pairs[pos_id]
-        session_q = self.sessions[query["query_session"]]
-        session_p = self.sessions[pos["query_session"]]
-        t0 = query["query_id"]
-        t1 = pos["query_id"]
-        key = f'{session_q}_{t0}_{session_p}_{t1}'
-        return os.path.join(self.icp_path, key + '.npy')
-
     def get_odometry(self, idx):
         """获取位姿变换矩阵"""
         query = self.pairs[idx]
@@ -182,20 +168,10 @@ class ChileanDatasetOverlap(Dataset):
 
     def __getitem__(self, idx):
         """
-        获取训练样本
+        获取训练样本（优化版：直接使用CSV高精度位姿，不需要ICP）
 
         Returns:
-            dict: {
-                'voxel0': 体素化的query点云,
-                'voxel1': 体素化的positive点云,
-                'trans0': query的变换矩阵,
-                'trans1': positive的变换矩阵,
-                'time': 数据加载时间,
-                'points0': query原始点,
-                'points1': positive原始点,
-                'points_xy0': query的XY投影点,
-                'points_xy1': positive的XY投影点
-            }
+            dict: 包含体素化点云、变换矩阵等信息
         """
         time0 = time.time()
         if torch.is_tensor(idx):
@@ -204,49 +180,18 @@ class ChileanDatasetOverlap(Dataset):
         queryid = idx % len(self.pairs)
         posid = self.get_random_positive(queryid)
 
+        # 加载点云
         query_points = self.load_pcd(queryid)
         pos_points = self.load_pcd(posid)
 
+        # 获取CSV中的高精度位姿
         query_odom = self.get_odometry(queryid)
         pos_odom = self.get_odometry(posid)
 
-        # 计算相对变换或使用ICP
-        filename = self.get_icp_name(queryid, posid)
-        if filename not in self.chilean_icp_cache:
-            if not os.path.exists(filename):
-                # 计算初始相对变换
-                M = query_odom.T @ np.linalg.inv(pos_odom.T)
-                M = M.T
-
-                # 使用ICP精细对齐
-                query_points_t = utils.apply_transform(query_points, M)
-                pcd0 = utils.make_open3d_point_cloud(query_points_t)
-                pcd1 = utils.make_open3d_point_cloud(pos_points)
-                reg = o3d.pipelines.registration.registration_icp(
-                    pcd0, pcd1, 0.2, np.eye(4),
-                    o3d.pipelines.registration.TransformationEstimationPointToPoint(),
-                    o3d.pipelines.registration.ICPConvergenceCriteria(max_iteration=200))
-                M2 = M @ reg.transformation
-                np.save(filename, M2)
-            else:
-                try:
-                    M2 = np.load(filename)
-                except Exception as inst:
-                    print(inst)
-                    M = query_odom.T @ np.linalg.inv(pos_odom.T)
-                    M = M.T
-                    query_points_t = utils.apply_transform(query_points, M)
-                    pcd0 = utils.make_open3d_point_cloud(query_points_t)
-                    pcd1 = utils.make_open3d_point_cloud(pos_points)
-                    reg = o3d.pipelines.registration.registration_icp(
-                        pcd0, pcd1, 0.2, np.eye(4),
-                        o3d.pipelines.registration.TransformationEstimationPointToPoint(),
-                        o3d.pipelines.registration.ICPConvergenceCriteria(max_iteration=200))
-                    M2 = M @ reg.transformation
-                    np.save(filename, M2)
-            self.chilean_icp_cache[filename] = M2
-        else:
-            M2 = self.chilean_icp_cache[filename]
+        # 直接计算相对变换（利用CSV的高精度位姿）
+        # query到pos的变换 = query的世界坐标系变换 @ pos的世界坐标系变换的逆
+        M2 = query_odom.T @ np.linalg.inv(pos_odom.T)
+        M2 = M2.T
 
         # 随机旋转数据增强
         if self.random_rotation:
